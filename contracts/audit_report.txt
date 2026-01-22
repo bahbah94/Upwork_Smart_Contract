@@ -1,0 +1,144 @@
+Security Assessment Report – DePayNFTAirdropV1
+
+1. Scope and methodology
+
+This report reviews the security and correctness of the DePayNFTAirdropV1 smart contract with focus on claim logic, EIP-712 signature design, replay resistance, and administrative controls. The analysis is based on manual code review and reasoning about protocol-level behavior rather than automated tooling.
+
+The goal is to identify design flaws and implementation risks that could lead to incorrect claims, loss of assets, denial of service, or replay attacks.
+
+2. High-level design overview
+
+The contract implements an off-chain authorized NFT airdrop. A distributor signs an EIP-712 message containing arrays of receivers and tokenIds. A user submits the signature and an index to claim a specific token.
+
+The core design choice is to authorize an entire set of receivers and tokenIds in a single signature, and allow the caller to select an index on-chain.
+
+This approach does not cryptographically bind a specific receiver to a specific tokenId. Instead, the contract relies on array alignment and user-supplied indices. Even with additional validation, this design cannot prove that a given receiver-token pair was explicitly authorized by the signer.
+
+This is a fundamental protocol-level weakness and the primary risk in the system.
+
+3. Claim function risks
+
+3.1 Index and array safety
+
+The claim function accepts a single index and uses it to access both receivers[index] and tokenIds[index].
+
+There are no explicit checks that:
+
+* index is strictly less than receivers.length and tokenIds.length
+* receivers.length equals tokenIds.length
+
+This can lead to out-of-bounds reverts or mismatched receiver-token pairs if the arrays are not perfectly aligned.
+
+3.2 Missing cryptographic binding of claims
+
+The contract only checks that:
+
+* the recovered signer equals distributor
+* receiver == msg.sender
+
+It does not verify that this receiver-token pair was individually authorized by the signer. The only proof is that both values appear somewhere in the signed arrays.
+
+This allows ambiguous authorization and makes the system fragile to any future extension, refactoring, or partial reuse of signatures.
+
+3.3 State update before external call
+
+The contract marks a claim as completed before performing the token transfer.
+
+If the transfer fails due to missing ownership, missing approval, or insufficient balance, the claim is already recorded as used, permanently blocking the receiver from retrying.
+
+This breaks atomicity and can lead to irreversible loss of claim rights.
+
+3.4 Missing ownership and approval checks
+
+There are no pre-transfer checks that:
+
+* the distributor owns the ERC721 token
+* the distributor has sufficient ERC1155 balance
+* the distributor has approved this contract
+
+As a result, claims may revert unpredictably after state changes.
+
+4. Signature and EIP-712 risks
+
+4.1 Incomplete domain separation
+
+The EIP-712 domain only includes a name field.
+
+It omits:
+
+* chainId
+* verifyingContract
+
+This enables replay attacks where the same signature can be reused:
+
+* on a different chain
+* on a cloned contract with the same name
+
+Proper domain separation is required to prevent cross-chain and cross-contract replay.
+
+4.2 Unsafe hashing of dynamic arrays
+
+The contract uses abi.encodePacked on dynamic arrays when computing the struct hash.
+
+This is unsafe and can lead to hash collisions where different arrays produce the same hash. This is a known pitfall in Solidity when hashing variable-length data.
+
+This weakens the integrity of the signed message and undermines the security of the authorization.
+
+4.3 Signature malleability
+
+The contract uses ecrecover directly without enforcing:
+
+* valid v values
+* lower-half s values
+
+This allows malleable signatures and weakens replay protection and uniqueness of authorizations.
+
+5. Cancellation logic risks
+
+Cancellation is keyed only by distributor and tokenAddress.
+
+This means that:
+
+* multiple independent airdrops for the same token cannot coexist safely
+* cancelling one airdrop invalidates all future and past airdrops for that token and distributor pair
+
+There is no per-airdrop identifier, nonce, or unique airdrop hash.
+
+Additionally, the distributor can cancel after some claims have already been executed, permanently blocking remaining receivers.
+
+There is no restriction that cancellation must occur before the first claim.
+
+6. Administrative kill switch risk
+
+The contract owner can selfdestruct the contract at any time.
+
+This allows:
+
+* permanent denial of service for all pending claims
+* irreversible loss of functionality for all users
+
+This introduces a strong centralization and rug risk that is unacceptable for a trust-minimized distribution system.
+
+7. Summary of primary risks
+
+The most severe issues are:
+
+* Fundamental design flaw: signing arrays with index-based claims does not cryptographically bind receiver to tokenId.
+* Replay attacks due to missing chainId and verifyingContract in the domain.
+* Unsafe hashing of dynamic arrays leading to potential hash collisions.
+* Non-atomic claim execution that can permanently block users.
+* Overly coarse cancellation logic affecting multiple airdrops.
+* Unrestricted selfdestruct controlled by a single admin key.
+
+8. Recommendations
+
+The airdrop design should be redesigned to:
+
+* Sign one claim per receiver per tokenId.
+* Use a full EIP-712 domain including chainId and verifyingContract.
+* Avoid abi.encodePacked on dynamic arrays; use typed hashing or a standard EIP-712 implementation.
+* Perform token transfers before marking claims as completed.
+* Introduce a unique per-airdrop identifier or nonce.
+* Remove or heavily restrict the selfdestruct function.
+
+Without addressing the protocol-level design flaw, incremental fixes to validation or checks will not provide sufficient security.
